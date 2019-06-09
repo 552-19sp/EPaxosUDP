@@ -407,7 +407,7 @@ func (r *Replica) ReplyBeacon(beacon *Beacon) {
 	}
 }
 
-func (r *Replica) shouldSendMsg() {
+func (r *Replica) shouldSendMsg() bool {
 	rNum := uint16(rand.Intn(1000)) + 1
 	return rNum > r.DropRate
 }

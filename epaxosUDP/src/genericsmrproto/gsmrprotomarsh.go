@@ -740,3 +740,38 @@ func (t *ProposeReplyTS) Unmarshal(wire io.Reader) error {
 	t.Timestamp = int64((uint64(bs[0]) | (uint64(bs[1]) << 8) | (uint64(bs[2]) << 16) | (uint64(bs[3]) << 24) | (uint64(bs[4]) << 32) | (uint64(bs[5]) << 40) | (uint64(bs[6]) << 48) | (uint64(bs[7]) << 56)))
 	return nil
 }
+
+func (t *SetDropRate) Marshal(wire io.Writer) {
+	var b [2]byte
+	var bs []byte
+	bs = b[:2]
+	tmp16 := t.DropRate
+	bs[0] = byte(tmp16)
+	bs[1] = byte(tmp16 >> 8)
+	wire.Write(bs)
+}
+
+func (t *SetDropRate) Unmarshal(wire io.Reader) error {
+	var b [2]byte
+	var bs []byte
+	bs = b[:2]
+	if _, err := io.ReadAtLeast(wire, bs, 2); err != nil {
+		return err
+	}
+	t.DropRate = uint16((uint16(bs[0]) | (uint16(bs[1]) << 8)))
+	return nil
+}
+
+func (t *KillServer) Marshal(wire io.Writer) {
+}
+
+func (t *KillServer) Unmarshal(wire io.Reader) error {
+	return nil
+}
+
+func (t *ReviveServer) Marshal(wire io.Writer) {
+}
+
+func (t *ReviveServer) Unmarshal(wire io.Reader) error {
+	return nil
+}

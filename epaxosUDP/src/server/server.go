@@ -25,7 +25,7 @@ var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7087.")
 var myAddr *string = flag.String("addr", "", "Server address (this machine). Defaults to localhost.")
 var doMencius *bool = flag.Bool("m", false, "Use Mencius as the replication protocol. Defaults to false.")
 var doGpaxos *bool = flag.Bool("g", false, "Use Generalized Paxos as the replication protocol. Defaults to false.")
-var doEpaxos *bool = flag.Bool("e", true, "Use EPaxos as the replication protocol. Defaults to false.")
+var doEpaxos *bool = flag.Bool("e", false, "Use EPaxos as the replication protocol. Defaults to false.")
 var procs *int = flag.Int("p", 2, "GOMAXPROCS. Defaults to 2")
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 var thrifty = flag.Bool("thrifty", false, "Use only as many messages as strictly required for inter-replica communication.")
@@ -75,7 +75,7 @@ func main() {
 
 	rpc.HandleHTTP()
 	//listen for RPC on a different port (8070 by default)
-	l, err := net.Listen("udp", fmt.Sprintf(":%d", *portnum+1000))
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", *portnum+1000))
 	if err != nil {
 		log.Fatal("listen error:", err)
 	}
@@ -88,7 +88,7 @@ func registerWithMaster(masterAddr string) (int, []string) {
 	var reply masterproto.RegisterReply
 
 	for done := false; !done; {
-		mcli, err := rpc.Dial("udp", masterAddr)
+		mcli, err := rpc.DialHTTP("tcp", masterAddr)
 		if err == nil {
 			err = mcli.Call("Master.Register", args, &reply)
 			if err == nil && reply.Ready == true {

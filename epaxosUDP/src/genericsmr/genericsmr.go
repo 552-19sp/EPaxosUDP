@@ -3,11 +3,13 @@ package genericsmr
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fastrpc"
 	"fmt"
 	"genericsmrproto"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"rdtsc"
@@ -65,6 +67,9 @@ type Replica struct {
 	Ewma []float64
 
 	OnClientConnect chan bool
+
+	DropRate uint16 // Drop rate for server. Out of 1000.
+	isAlive  bool   // Liveness for current server.
 }
 
 func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply bool) *Replica {
@@ -91,7 +96,9 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 		make(map[uint8]*RPCPair),
 		genericsmrproto.GENERIC_SMR_BEACON_REPLY + 1,
 		make([]float64, len(peerAddrList)),
-		make(chan bool, 100)}
+		make(chan bool, 100),
+		0,
+		true}
 
 	var err error
 
@@ -110,11 +117,17 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 /* Client API */
 
 func (r *Replica) Ping(args *genericsmrproto.PingArgs, reply *genericsmrproto.PingReply) error {
-	return nil
+	if r.isAlive {
+		return nil
+	}
+	return errors.New("server is not alive")
 }
 
 func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
-	return nil
+	if r.isAlive {
+		return nil
+	}
+	return errors.New("server is not alive")
 }
 
 /* ============= */
@@ -129,7 +142,7 @@ func (r *Replica) ConnectToPeers() {
 	//connect to peers
 	for i := 0; i < int(r.Id); i++ {
 		for done := false; !done; {
-			if conn, err := net.Dial("udp", r.PeerAddrList[i]); err == nil {
+			if conn, err := net.Dial("tcp", r.PeerAddrList[i]); err == nil {
 				r.Peers[i] = conn
 				done = true
 			} else {
@@ -166,7 +179,7 @@ func (r *Replica) ConnectToPeersNoListeners() {
 	//connect to peers
 	for i := 0; i < int(r.Id); i++ {
 		for done := false; !done; {
-			if conn, err := net.Dial("udp", r.PeerAddrList[i]); err == nil {
+			if conn, err := net.Dial("tcp", r.PeerAddrList[i]); err == nil {
 				r.Peers[i] = conn
 				done = true
 			} else {
@@ -191,7 +204,7 @@ func (r *Replica) waitForPeerConnections(done chan bool) {
 	var b [4]byte
 	bs := b[:4]
 
-	r.Listener, _ = net.Listen("udp", r.PeerAddrList[r.Id])
+	r.Listener, _ = net.Listen("tcp", r.PeerAddrList[r.Id])
 	for i := r.Id + 1; i < int32(r.N); i++ {
 		conn, err := r.Listener.Accept()
 		if err != nil {
@@ -307,6 +320,22 @@ func (r *Replica) clientListener(conn net.Conn) {
 			}
 			//r.ProposeAndReadChan <- pr
 			break
+
+		case genericsmrproto.SET_DROP_RATE:
+			dr := new(genericsmrproto.SetDropRate)
+			if err = dr.Unmarshal(reader); err != nil {
+				break
+			}
+			r.DropRate = dr.DropRate
+			break
+
+		case genericsmrproto.KILL_SERVER:
+			r.isAlive = false
+			break
+
+		case genericsmrproto.REVIVE_SERVER:
+			r.isAlive = true
+			break
 		}
 	}
 	if err != nil && err != io.EOF {
@@ -322,48 +351,65 @@ func (r *Replica) RegisterRPC(msgObj fastrpc.Serializable, notify chan fastrpc.S
 }
 
 func (r *Replica) SendMsg(peerId int32, code uint8, msg fastrpc.Serializable) {
-	w := r.PeerWriters[peerId]
-	w.WriteByte(code)
-	msg.Marshal(w)
-	w.Flush()
+	if r.shouldSendMsg() {
+		w := r.PeerWriters[peerId]
+		w.WriteByte(code)
+		msg.Marshal(w)
+		w.Flush()
+	}
 }
 
 func (r *Replica) SendMsgNoFlush(peerId int32, code uint8, msg fastrpc.Serializable) {
-	w := r.PeerWriters[peerId]
-	w.WriteByte(code)
-	msg.Marshal(w)
+	if r.shouldSendMsg() {
+		w := r.PeerWriters[peerId]
+		w.WriteByte(code)
+		msg.Marshal(w)
+	}
 }
 
 func (r *Replica) ReplyPropose(reply *genericsmrproto.ProposeReply, w *bufio.Writer) {
 	//r.clientMutex.Lock()
 	//defer r.clientMutex.Unlock()
 	//w.WriteByte(genericsmrproto.PROPOSE_REPLY)
-	reply.Marshal(w)
-	w.Flush()
+	if r.shouldSendMsg() {
+		reply.Marshal(w)
+		w.Flush()
+	}
 }
 
 func (r *Replica) ReplyProposeTS(reply *genericsmrproto.ProposeReplyTS, w *bufio.Writer) {
 	//r.clientMutex.Lock()
 	//defer r.clientMutex.Unlock()
 	//w.WriteByte(genericsmrproto.PROPOSE_REPLY)
-	reply.Marshal(w)
-	w.Flush()
+	if r.shouldSendMsg() {
+		reply.Marshal(w)
+		w.Flush()
+	}
 }
 
 func (r *Replica) SendBeacon(peerId int32) {
-	w := r.PeerWriters[peerId]
-	w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON)
-	beacon := &genericsmrproto.Beacon{rdtsc.Cputicks()}
-	beacon.Marshal(w)
-	w.Flush()
+	if r.shouldSendMsg() {
+		w := r.PeerWriters[peerId]
+		w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON)
+		beacon := &genericsmrproto.Beacon{rdtsc.Cputicks()}
+		beacon.Marshal(w)
+		w.Flush()
+	}
 }
 
 func (r *Replica) ReplyBeacon(beacon *Beacon) {
-	w := r.PeerWriters[beacon.Rid]
-	w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON_REPLY)
-	rb := &genericsmrproto.BeaconReply{beacon.Timestamp}
-	rb.Marshal(w)
-	w.Flush()
+	if r.shouldSendMsg() {
+		w := r.PeerWriters[beacon.Rid]
+		w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON_REPLY)
+		rb := &genericsmrproto.BeaconReply{beacon.Timestamp}
+		rb.Marshal(w)
+		w.Flush()
+	}
+}
+
+func (r *Replica) shouldSendMsg() {
+	rNum := uint16(rand.Intn(1000)) + 1
+	return rNum > r.DropRate
 }
 
 // updates the preferred order in which to communicate with peers according to a preferred quorum

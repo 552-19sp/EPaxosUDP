@@ -13,6 +13,9 @@ const (
 	PROPOSE_AND_READ_REPLY
 	GENERIC_SMR_BEACON
 	GENERIC_SMR_BEACON_REPLY
+	SET_DROP_RATE
+	KILL_SERVER
+	REVIVE_SERVER
 )
 
 type Propose struct {
@@ -76,4 +79,15 @@ type BeTheLeaderArgs struct {
 }
 
 type BeTheLeaderReply struct {
+}
+
+// Testing specific messages
+type SetDropRate struct {
+	DropRate uint16
+}
+
+type KillServer struct {
+}
+
+type ReviveServer struct {
 }

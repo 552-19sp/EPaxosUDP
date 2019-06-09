@@ -43,7 +43,7 @@ func main() {
 		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
 	}
 
-	master, err := rpc.Dial("udp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
+	master, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
 	if err != nil {
 		log.Fatalf("Error connecting to master\n")
 	}
@@ -117,7 +117,7 @@ func simulatedClient(rlReply *masterproto.GetReplicaListReply, leader int, readi
 
 	for i := 0; i < N; i++ {
 		var err error
-		servers[i], err = net.Dial("udp", rlReply.ReplicaList[i])
+		servers[i], err = net.Dial("tcp", rlReply.ReplicaList[i])
 		if err != nil {
 			log.Printf("Error connecting to replica %d\n", i)
 		}

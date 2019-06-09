@@ -11,16 +11,17 @@ import (
 	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
 	"runtime"
 	"state"
+	"strconv"
 	"time"
 )
 
-var masterAddr *string = flag.String("maddr", "", "Master address. Defaults to localhost")
-var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7077.")
-var reqsNb *int = flag.Int("q", 5000, "Total number of requests. Defaults to 5000.")
+var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7087.")
+var reqsNb *int = flag.Int("q", 500, "Total number of requests. Defaults to 5000.")
 var writes *int = flag.Int("w", 100, "Percentage of updates (writes). Defaults to 100%.")
-var noLeader *bool = flag.Bool("e", false, "Egalitarian (no leader). Defaults to false.")
+var noLeader *bool = flag.Bool("e", true, "Egalitarian (no leader). Defaults to true.")
 var fast *bool = flag.Bool("f", false, "Fast Paxos: send message directly to all replicas. Defaults to false.")
 var rounds *int = flag.Int("r", 1, "Split the total number of requests into this many rounds, and do rounds sequentially. Defaults to 1.")
 var procs *int = flag.Int("p", 2, "GOMAXPROCS. Defaults to 2")
@@ -37,10 +38,51 @@ var successful []int
 var rarray []int
 var rsp []bool
 
+var masterAddr *string
+var threeReplicaMasterAddr string
+var fiveReplicaMasterAddr string
+
 func main() {
 	flag.Parse()
 
 	runtime.GOMAXPROCS(*procs)
+
+	if len(os.Args) < 4 {
+		log.Fatalln("usage: client <num-servers> <drop-rate> <random-failures-bit>")
+	}
+
+	// TODO: Connect to the correct master for the given number of servers.
+	numServers, err := strconv.Atoi(os.Args[1])
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	if numServers == 3 {
+		masterAddr = &threeReplicaMasterAddr
+	} else if numServers == 5 {
+		masterAddr = &fiveReplicaMasterAddr
+	} else {
+		log.Fatal("must specify 3 or 5 replica cluster")
+	}
+
+	dropRate, err := strconv.Atoi(os.Args[2])
+	_ = dropRate // Drop rate ignored for TCP.
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	randomFailures, err := strconv.ParseBool(os.Args[3])
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	numServersToFail := 0
+	if randomFailures {
+		numServersToFail = (numServers - 1) / 2
+	}
 
 	randObj := rand.New(rand.NewSource(42))
 	zipf := rand.NewZipf(randObj, *s, *v, uint64(*reqsNb / *rounds + *eps))
@@ -49,7 +91,7 @@ func main() {
 		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
 	}
 
-	master, err := rpc.Dial("udp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
+	master, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
 	if err != nil {
 		log.Fatalf("Error connecting to master\n")
 	}
@@ -104,7 +146,7 @@ func main() {
 
 	for i := 0; i < N; i++ {
 		var err error
-		servers[i], err = net.Dial("udp", rlReply.ReplicaList[i])
+		servers[i], err = net.Dial("tcp", rlReply.ReplicaList[i])
 		if err != nil {
 			log.Printf("Error connecting to replica %d\n", i)
 		}
@@ -122,6 +164,24 @@ func main() {
 		}
 		leader = reply.LeaderId
 		log.Printf("The leader is replica %d\n", leader)
+	}
+
+	// Make sure all servers are revived.
+	reviveMsg := genericsmrproto.ReviveServer{}
+	for rep := 0; rep < N; rep++ {
+		writers[rep].WriteByte(genericsmrproto.REVIVE_SERVER)
+		reviveMsg.Marshal(writers[rep])
+		writers[rep].Flush()
+	}
+
+	// Drop rate should be 0 for tcp.
+	dropRateMsg := genericsmrproto.SetDropRate{0}
+
+	// Set drop rate.
+	for rep := 0; rep < N; rep++ {
+		writers[rep].WriteByte(genericsmrproto.SET_DROP_RATE)
+		dropRateMsg.Marshal(writers[rep])
+		writers[rep].Flush()
 	}
 
 	var id int32 = 0
@@ -147,6 +207,12 @@ func main() {
 			}
 		} else {
 			go waitReplies(readers, leader, n, done)
+		}
+
+		var indiciesToKillServerOn []int
+		for i := 0; i < numServersToFail; i++ {
+			n := rand.Intn(n + *eps)
+			indiciesToKillServerOn = append(indiciesToKillServerOn, n)
 		}
 
 		before := time.Now()
@@ -182,6 +248,16 @@ func main() {
 				for i := 0; i < N; i++ {
 					writers[i].Flush()
 				}
+			}
+
+			// Kill a server, if necessary. Set drop rate to max and
+			// send kill message.
+			if contains(indiciesToKillServerOn, i) {
+				serverToKill := writers[rand.Intn(N)]
+				killMsg := genericsmrproto.KillServer{}
+				serverToKill.WriteByte(genericsmrproto.KILL_SERVER)
+				killMsg.Marshal(serverToKill)
+				serverToKill.Flush()
 			}
 		}
 		for i := 0; i < N; i++ {
@@ -262,4 +338,13 @@ func waitReplies(readers []*bufio.Reader, leader int, n int, done chan bool) {
 		}
 	}
 	done <- e
+}
+
+func contains(s []int, e int) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
 }

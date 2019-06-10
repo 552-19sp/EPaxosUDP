@@ -19,7 +19,7 @@ import (
 )
 
 var masterPort *int = flag.Int("mport", 7087, "Master port.  Defaults to 7087.")
-var reqsNb *int = flag.Int("q", 500, "Total number of requests. Defaults to 5000.")
+var reqsNb *int = flag.Int("q", 100, "Total number of requests. Defaults to 5000.")
 var writes *int = flag.Int("w", 100, "Percentage of updates (writes). Defaults to 100%.")
 var noLeader *bool = flag.Bool("e", true, "Egalitarian (no leader). Defaults to true.")
 var fast *bool = flag.Bool("f", false, "Fast Paxos: send message directly to all replicas. Defaults to false.")
@@ -41,6 +41,8 @@ var rsp []bool
 var masterAddr *string
 var threeReplicaMasterAddr string
 var fiveReplicaMasterAddr string
+
+var addresses = []string{":11111", ":11112", ":11113"}
 
 func main() {
 	flag.Parse()
@@ -67,7 +69,6 @@ func main() {
 	}
 
 	dropRate, err := strconv.Atoi(os.Args[2])
-	_ = dropRate // Drop rate ignored for TCP.
 	if err != nil {
 		log.Fatalln(err)
 		return
@@ -91,11 +92,13 @@ func main() {
 		log.Fatalf("Conflicts percentage must be between 0 and 100.\n")
 	}
 
+	log.Println("Connecting to master...")
 	master, err := rpc.DialHTTP("tcp", fmt.Sprintf("%s:%d", *masterAddr, *masterPort))
 	if err != nil {
 		log.Fatalf("Error connecting to master\n")
 	}
 
+	log.Println("Geting replica list from master...")
 	rlReply := new(masterproto.GetReplicaListReply)
 	err = master.Call("Master.GetReplicaList", new(masterproto.GetReplicaListArgs), rlReply)
 	if err != nil {
@@ -112,6 +115,8 @@ func main() {
 	put := make([]bool, *reqsNb / *rounds + *eps)
 	perReplicaCount := make([]int, N)
 	test := make([]int, *reqsNb / *rounds + *eps)
+
+	log.Println("Beginning to process workload...")
 	for i := 0; i < len(rarray); i++ {
 		r := rand.Intn(N)
 		rarray[i] = r
@@ -146,9 +151,9 @@ func main() {
 
 	for i := 0; i < N; i++ {
 		var err error
-		servers[i], err = net.Dial("tcp", rlReply.ReplicaList[i])
+		servers[i], err = net.Dial("tcp", addresses[i])
 		if err != nil {
-			log.Printf("Error connecting to replica %d\n", i)
+			log.Printf("Error connecting to replica %d: %s\n", i, err.Error())
 		}
 		readers[i] = bufio.NewReader(servers[i])
 		writers[i] = bufio.NewWriter(servers[i])
@@ -174,8 +179,7 @@ func main() {
 		writers[rep].Flush()
 	}
 
-	// Drop rate should be 0 for tcp.
-	dropRateMsg := genericsmrproto.SetDropRate{0}
+	dropRateMsg := genericsmrproto.SetDropRate{uint16(dropRate)}
 
 	// Set drop rate.
 	for rep := 0; rep < N; rep++ {
@@ -199,6 +203,11 @@ func main() {
 			for j := 0; j < n; j++ {
 				rsp[j] = false
 			}
+		}
+
+		rsp = make([]bool, n)
+		for j := 0; j < n; j++ {
+			rsp[j] = false
 		}
 
 		if *noLeader {
@@ -264,6 +273,8 @@ func main() {
 			writers[i].Flush()
 		}
 
+		go retryOperations(karray, writers)
+
 		err := false
 		if *noLeader {
 			for i := 0; i < N; i++ {
@@ -314,6 +325,41 @@ func main() {
 		}
 	}
 	master.Close()
+}
+
+func retryOperations(karray []int64, writers []*bufio.Writer) {
+	log.Println("retrying")
+	time.Sleep(200 * time.Millisecond)
+	count := 0
+	retried := false
+	for i, val := range rsp {
+		if !val {
+			// Try sending request again.
+			id := int32(i)
+			args := genericsmrproto.Propose{id, state.Command{state.PUT, 0, 0}, 0}
+			args.CommandId = id
+			args.Command.Op = state.PUT
+			args.Command.K = state.Key(karray[i])
+			args.Command.V = state.Value(i)
+
+			// Send request to everyone.
+			for rep := 0; rep < N; rep++ {
+				writers[rep].WriteByte(genericsmrproto.PROPOSE)
+				args.Marshal(writers[rep])
+				writers[rep].Flush()
+			}
+
+			retried = true
+			count++
+		}
+	}
+
+	log.Printf("Retried: %d\n", count)
+
+	// If we just had to retry something, keep checking. Otherwise, finish.
+	if retried {
+		retryOperations(karray, writers)
+	}
 }
 
 func waitReplies(readers []*bufio.Reader, leader int, n int, done chan bool) {

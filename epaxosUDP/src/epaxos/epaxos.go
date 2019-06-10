@@ -270,10 +270,8 @@ var conflicted, weird, slow, happy int
 ************************************/
 
 func (r *Replica) run() {
-	r.ConnectToPeers()
-
-	dlog.Println("Waiting for client connections")
-
+	dlog.Println("Start listening")
+	go r.StartListening()
 	go r.WaitForClientConnections()
 
 	if r.Exec {
@@ -614,6 +612,8 @@ func (r *Replica) bcastAccept(replica int32, instance int32, ballot int32, count
 		}
 	}()
 
+	log.Println("SENDING ACCEPT")
+
 	ea.LeaderId = r.Id
 	ea.Replica = replica
 	ea.Instance = instance
@@ -704,8 +704,8 @@ func (r *Replica) updateConflicts(cmds []state.Command, replica int32, instance 
 				r.conflicts[replica][cmds[i].K] = instance
 			}
 		} else {
-            r.conflicts[replica][cmds[i].K] = instance
-        }
+			r.conflicts[replica][cmds[i].K] = instance
+		}
 		if s, present := r.maxSeqPerKey[cmds[i].K]; present {
 			if s < seq {
 				r.maxSeqPerKey[cmds[i].K] = seq
@@ -801,6 +801,7 @@ func bfFromCommands(cmds []state.Command) *bloomfilter.Bloomfilter {
 func (r *Replica) handlePropose(propose *genericsmr.Propose) {
 	//TODO!! Handle client retries
 
+	log.Println("HandlePropose")
 	batchSize := len(r.ProposeChan) + 1
 	if batchSize > MAX_BATCH {
 		batchSize = MAX_BATCH
@@ -855,7 +856,9 @@ func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, propo
 	r.recordCommands(cmds)
 	r.sync()
 
+	log.Println("About to broadcast preaccept 1")
 	r.bcastPreAccept(r.Id, instance, ballot, cmds, seq, deps)
+	log.Println("Done")
 
 	cpcounter += batchSize
 
@@ -892,12 +895,15 @@ func (r *Replica) startPhase1(replica int32, instance int32, ballot int32, propo
 		r.recordInstanceMetadata(r.InstanceSpace[r.Id][instance])
 		r.sync()
 
+		log.Println("About to broadcast preaccept 2")
 		r.bcastPreAccept(r.Id, instance, 0, cpMarker, r.maxSeq, deps)
 	}
 }
 
 func (r *Replica) handlePreAccept(preAccept *epaxosproto.PreAccept) {
 	inst := r.InstanceSpace[preAccept.LeaderId][preAccept.Instance]
+
+	log.Println("GOT PreAccept")
 
 	if preAccept.Seq >= r.maxSeq {
 		r.maxSeq = preAccept.Seq + 1
@@ -1048,6 +1054,7 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 
 	//can we commit on the fast path?
 	if inst.lb.preAcceptOKs >= r.N/2 && inst.lb.allEqual && allCommitted && isInitialBallot(inst.ballot) {
+		log.Println("FAST PATH")
 		happy++
 		dlog.Printf("Fast path for instance %d.%d\n", pareply.Replica, pareply.Instance)
 		r.InstanceSpace[pareply.Replica][pareply.Instance].Status = epaxosproto.COMMITTED
@@ -1070,6 +1077,7 @@ func (r *Replica) handlePreAcceptReply(pareply *epaxosproto.PreAcceptReply) {
 
 		r.bcastCommit(pareply.Replica, pareply.Instance, inst.Cmds, inst.Seq, inst.Deps)
 	} else if inst.lb.preAcceptOKs >= r.N/2 {
+		log.Println("SLOW PATH")
 		if !allCommitted {
 			weird++
 		}
@@ -1148,6 +1156,7 @@ func (r *Replica) handlePreAcceptOK(pareply *epaxosproto.PreAcceptOK) {
 ***********************************************************************/
 
 func (r *Replica) handleAccept(accept *epaxosproto.Accept) {
+	log.Println("HANDLING ACCEPT")
 	inst := r.InstanceSpace[accept.LeaderId][accept.Instance]
 
 	if accept.Seq >= r.maxSeq {
@@ -1202,6 +1211,7 @@ func (r *Replica) handleAccept(accept *epaxosproto.Accept) {
 }
 
 func (r *Replica) handleAcceptReply(areply *epaxosproto.AcceptReply) {
+	log.Println("HANDLE ACCEPT REPLY")
 	inst := r.InstanceSpace[areply.Replica][areply.Instance]
 
 	if inst.Status != epaxosproto.ACCEPTED {
@@ -1257,6 +1267,7 @@ func (r *Replica) handleAcceptReply(areply *epaxosproto.AcceptReply) {
 ***********************************************************************/
 
 func (r *Replica) handleCommit(commit *epaxosproto.Commit) {
+	log.Println("Handle Commit")
 	inst := r.InstanceSpace[commit.Replica][commit.Instance]
 
 	if commit.Seq >= r.maxSeq {

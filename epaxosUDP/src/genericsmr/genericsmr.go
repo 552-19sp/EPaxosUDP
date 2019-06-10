@@ -2,7 +2,6 @@ package genericsmr
 
 import (
 	"bufio"
-	"encoding/binary"
 	"errors"
 	"fastrpc"
 	"fmt"
@@ -14,7 +13,7 @@ import (
 	"os"
 	"rdtsc"
 	"state"
-	"time"
+	"strings"
 )
 
 const CHAN_BUFFER_SIZE = 200000
@@ -34,15 +33,17 @@ type Beacon struct {
 	Timestamp uint64
 }
 
+var addresses = []string{":11111", ":11112", ":11113"}
+
 type Replica struct {
-	N            int        // total number of replicas
-	Id           int32      // the ID of the current replica
-	PeerAddrList []string   // array with the IP:port address of every replica
-	Peers        []net.Conn // cache of connections to all other replicas
-	PeerReaders  []*bufio.Reader
-	PeerWriters  []*bufio.Writer
-	Alive        []bool // connection status
-	Listener     net.Listener
+	N              int      // total number of replicas
+	Id             int32    // the ID of the current replica
+	PeerAddrList   []string // array with the IP:port address of every replica
+	PeerReaders    []*bufio.Reader
+	PeerWriters    []*bufio.Writer
+	Alive          []bool // connection status
+	Listener       net.Listener
+	PacketListener net.PacketConn
 
 	State *state.State
 
@@ -77,10 +78,10 @@ func NewReplica(id int, peerAddrList []string, thrifty bool, exec bool, dreply b
 		len(peerAddrList),
 		int32(id),
 		peerAddrList,
-		make([]net.Conn, len(peerAddrList)),
 		make([]*bufio.Reader, len(peerAddrList)),
 		make([]*bufio.Writer, len(peerAddrList)),
 		make([]bool, len(peerAddrList)),
+		nil,
 		nil,
 		state.InitState(),
 		make(chan *Propose, CHAN_BUFFER_SIZE),
@@ -132,101 +133,10 @@ func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *gene
 
 /* ============= */
 
-func (r *Replica) ConnectToPeers() {
-	var b [4]byte
-	bs := b[:4]
-	done := make(chan bool)
-
-	go r.waitForPeerConnections(done)
-
-	//connect to peers
-	for i := 0; i < int(r.Id); i++ {
-		for done := false; !done; {
-			if conn, err := net.Dial("tcp", r.PeerAddrList[i]); err == nil {
-				r.Peers[i] = conn
-				done = true
-			} else {
-				time.Sleep(1e9)
-			}
-		}
-		binary.LittleEndian.PutUint32(bs, uint32(r.Id))
-		if _, err := r.Peers[i].Write(bs); err != nil {
-			fmt.Println("Write id error:", err)
-			continue
-		}
-		r.Alive[i] = true
-		r.PeerReaders[i] = bufio.NewReader(r.Peers[i])
-		r.PeerWriters[i] = bufio.NewWriter(r.Peers[i])
-	}
-	<-done
-	log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
-
-	for rid, reader := range r.PeerReaders {
-		if int32(rid) == r.Id {
-			continue
-		}
-		go r.replicaListener(rid, reader)
-	}
-}
-
-func (r *Replica) ConnectToPeersNoListeners() {
-	var b [4]byte
-	bs := b[:4]
-	done := make(chan bool)
-
-	go r.waitForPeerConnections(done)
-
-	//connect to peers
-	for i := 0; i < int(r.Id); i++ {
-		for done := false; !done; {
-			if conn, err := net.Dial("tcp", r.PeerAddrList[i]); err == nil {
-				r.Peers[i] = conn
-				done = true
-			} else {
-				time.Sleep(1e9)
-			}
-		}
-		binary.LittleEndian.PutUint32(bs, uint32(r.Id))
-		if _, err := r.Peers[i].Write(bs); err != nil {
-			fmt.Println("Write id error:", err)
-			continue
-		}
-		r.Alive[i] = true
-		r.PeerReaders[i] = bufio.NewReader(r.Peers[i])
-		r.PeerWriters[i] = bufio.NewWriter(r.Peers[i])
-	}
-	<-done
-	log.Printf("Replica id: %d. Done connecting to peers\n", r.Id)
-}
-
-/* Peer (replica) connections dispatcher */
-func (r *Replica) waitForPeerConnections(done chan bool) {
-	var b [4]byte
-	bs := b[:4]
-
-	r.Listener, _ = net.Listen("tcp", r.PeerAddrList[r.Id])
-	for i := r.Id + 1; i < int32(r.N); i++ {
-		conn, err := r.Listener.Accept()
-		if err != nil {
-			fmt.Println("Accept error:", err)
-			continue
-		}
-		if _, err := io.ReadFull(conn, bs); err != nil {
-			fmt.Println("Connection establish error:", err)
-			continue
-		}
-		id := int32(binary.LittleEndian.Uint32(bs))
-		r.Peers[id] = conn
-		r.PeerReaders[id] = bufio.NewReader(conn)
-		r.PeerWriters[id] = bufio.NewWriter(conn)
-		r.Alive[id] = true
-	}
-
-	done <- true
-}
-
 /* Client connections dispatcher */
 func (r *Replica) WaitForClientConnections() {
+	log.Println("Listening on %s", addresses[r.Id])
+	r.Listener, _ = net.Listen("tcp", addresses[r.Id])
 	for !r.Shutdown {
 		conn, err := r.Listener.Accept()
 		if err != nil {
@@ -239,13 +149,41 @@ func (r *Replica) WaitForClientConnections() {
 	}
 }
 
-func (r *Replica) replicaListener(rid int, reader *bufio.Reader) {
+func (r *Replica) StartListening() {
 	var msgType uint8
 	var err error = nil
 	var gbeacon genericsmrproto.Beacon
 	var gbeaconReply genericsmrproto.BeaconReply
+	var n int
+	var addr net.Addr
+	buffer := make([]byte, 1024)
+
+	// Set all servers to be alive
+	for i := 0; i < r.N; i++ {
+		r.Alive[i] = true
+	}
+
+	r.PacketListener, err = net.ListenPacket("udp", r.PeerAddrList[r.Id])
+	if err != nil {
+		log.Println("error on listen packet: %s", err.Error())
+	}
 
 	for err == nil && !r.Shutdown {
+		log.Println("listening")
+		n, addr, err = r.PacketListener.ReadFrom(buffer)
+		log.Println("read something")
+		if err != nil {
+			log.Println("packet listener error: ", err.Error())
+			break
+		}
+		reader := strings.NewReader(string(buffer[:n]))
+		rid := -1
+		for id, serverAddr := range r.PeerAddrList {
+			if serverAddr == addr.String() {
+				rid = id
+				break
+			}
+		}
 
 		if msgType, err = reader.ReadByte(); err != nil {
 			break
@@ -350,9 +288,41 @@ func (r *Replica) RegisterRPC(msgObj fastrpc.Serializable, notify chan fastrpc.S
 	return code
 }
 
+type UDPWriter struct {
+	conn    net.PacketConn
+	address net.Addr
+}
+
+type MyAddr struct {
+	address string
+}
+
+func (a MyAddr) Network() string {
+	return "udp"
+}
+
+func (a MyAddr) String() string {
+	return a.address
+}
+
+func (w UDPWriter) Write(p []byte) (n int, err error) {
+	conn, err := net.Dial("udp", w.address.String())
+	if err != nil {
+		log.Println(err)
+	}
+	defer conn.Close()
+	n, err2 := fmt.Fprintf(conn, string(p))
+	if err2 != nil {
+		log.Println(err2)
+		return -1, err2
+	}
+	return n, nil
+}
+
 func (r *Replica) SendMsg(peerId int32, code uint8, msg fastrpc.Serializable) {
+	log.Println("SENDING MSG: %d", code)
 	if r.shouldSendMsg() {
-		w := r.PeerWriters[peerId]
+		w := bufio.NewWriter(UDPWriter{r.PacketListener, MyAddr{r.PeerAddrList[peerId]}})
 		w.WriteByte(code)
 		msg.Marshal(w)
 		w.Flush()
@@ -389,7 +359,7 @@ func (r *Replica) ReplyProposeTS(reply *genericsmrproto.ProposeReplyTS, w *bufio
 
 func (r *Replica) SendBeacon(peerId int32) {
 	if r.shouldSendMsg() {
-		w := r.PeerWriters[peerId]
+		w := bufio.NewWriter(UDPWriter{r.PacketListener, MyAddr{r.PeerAddrList[peerId]}})
 		w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON)
 		beacon := &genericsmrproto.Beacon{rdtsc.Cputicks()}
 		beacon.Marshal(w)
@@ -399,7 +369,7 @@ func (r *Replica) SendBeacon(peerId int32) {
 
 func (r *Replica) ReplyBeacon(beacon *Beacon) {
 	if r.shouldSendMsg() {
-		w := r.PeerWriters[beacon.Rid]
+		w := bufio.NewWriter(UDPWriter{r.PacketListener, MyAddr{r.PeerAddrList[beacon.Rid]}})
 		w.WriteByte(genericsmrproto.GENERIC_SMR_BEACON_REPLY)
 		rb := &genericsmrproto.BeaconReply{beacon.Timestamp}
 		rb.Marshal(w)
